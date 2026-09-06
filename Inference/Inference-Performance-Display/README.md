@@ -2,6 +2,16 @@
   <img src="images/display-logo.png" alt="Inference Performance Display" width="480">
 </p>
 
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white" alt="Python 3.10+">
+  <img src="https://img.shields.io/badge/HTML5-E34F26?logo=html5&logoColor=white" alt="HTML5">
+  <img src="https://img.shields.io/badge/CSS3-1572B6?logo=css3&logoColor=white" alt="CSS3">
+  <img src="https://img.shields.io/badge/JavaScript-F7DF1E?logo=javascript&logoColor=black" alt="JavaScript">
+  <img src="https://img.shields.io/badge/Prometheus-E6522C?logo=prometheus&logoColor=white" alt="Prometheus">
+  <img src="https://img.shields.io/badge/OpenAI-000000?logo=openai&logoColor=white" alt="OpenAI-compatible">
+  <img src="https://img.shields.io/badge/No%20Dependencies-Standard%20Library%20Only-2E7D32" alt="No Dependencies">
+</p>
+
 <h1 align="center">Inference Performance Display</h1>
 
 一个无第三方依赖、可拓展的推理性能监测看板。后端使用 Python 标准库定时
