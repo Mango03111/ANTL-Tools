@@ -11,3 +11,4 @@
 | 3 | [APP流量生成脚本（APP）](#app) | 多机架流量生成 | [APP/](APP/) |
 | 4 | [推理相关脚本与工具（Inference）](#Inference) | 部署配置与性能监控 | [Inference/](Inference/) |
 | 5 | [CX系列网卡相关控制脚本（NIC control）](#NIC-control) | 命名空间隔离与静态 ARP配置 | [NIC control/](<NIC control/>) |
+| 6 | [Agent 服务管理脚本（Agent）](#agent) | Dify 服务的启动、停止与健康检查 | [Agent/](Agent/) |
