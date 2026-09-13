@@ -12,8 +12,8 @@ NS103="ns103"
 NS104="ns104"
 
 # interface inside namespace
-IF101="enp65s0f0np0"
-IF102="enp65s0f1np1"
+IF101="enp129s0f0np0"
+IF102="enp129s0f1np1"
 IF103="enp193s0f0np0"
 IF104="enp193s0f1np1"
 
