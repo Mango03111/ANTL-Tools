@@ -200,6 +200,7 @@
       gap: 16px;
     }
 
+    #service-select,
     #trend-range {
       flex: 0 0 auto;
       border: 1px solid var(--border);
@@ -209,6 +210,15 @@
       font: inherit;
       font-size: 12px;
       padding: 5px 8px;
+    }
+
+    .service-control {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      margin-right: 14px;
+      color: var(--muted);
+      font-size: 12px;
     }
 
     .legend {
@@ -261,6 +271,12 @@
         </div>
       </div>
       <nav>
+        <label class="service-control" for="service-select">
+          <span>服务</span>
+          <select id="service-select" aria-label="服务选择">
+            <option value="all" selected>全部聚合</option>
+          </select>
+        </label>
         <a href="/">性能展示</a>
         <div class="connection-state" id="status" data-state="connecting" role="status" aria-live="polite">
           <span class="status-dot" aria-hidden="true"></span>
@@ -304,9 +320,6 @@
       <div class="panel">
         <div class="panel-head">
           <div class="sub" id="trend-sub">左轴：输入 tokens / 写入周期　右轴：输出 tokens / 写入周期　横轴：时间段</div>
-          <select id="service-select" aria-label="服务选择">
-            <option value="all" selected>全部聚合</option>
-          </select>
           <select id="trend-range" aria-label="趋势时间范围">
             <option value="60" selected>近一小时</option>
             <option value="720">近12小时</option>
