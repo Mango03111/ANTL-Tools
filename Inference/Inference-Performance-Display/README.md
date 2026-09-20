@@ -35,15 +35,19 @@
   累计费用、当前模型（超长自动滚动），以及输入/输出 token 双纵轴趋势图，
   支持近一小时 / 近12小时 / 近24小时 时间范围（长范围自动做 15/30 分钟
   移动平均平滑）。
+- 多服务聚合：`services.yaml` 配置多个推理服务，性能与用量页面均可在
+  "全部聚合"与单个服务之间切换（详见"多服务监测"）。
 - 全部实现仅依赖 Python 标准库；不需要 Prometheus、Grafana、Node.js 或
   前端构建步骤。
 
 ## 前置条件
 
 - Python 3.10 或更高版本。
-- 一个已经运行、且可从宿主机访问的 OpenAI-compatible 推理服务（需暴露 Prometheus 指标端点）。
+- 一个或多个已经运行、且可从宿主机访问的 OpenAI-compatible 推理服务（需
+  暴露 Prometheus 指标端点）。
 - 默认地址为 `http://127.0.0.1:8000`，指标地址为
-  `http://127.0.0.1:8000/metrics`。
+  `http://127.0.0.1:8000/metrics`；多个服务在 `services.yaml` 中配置（见
+  "多服务监测"）。
 
 先确认现有实例可用：
 
@@ -98,13 +102,16 @@ python3 server.py
 重启自启，也不在进程崩溃后自动拉起；如需开机自启与崩溃自愈，请改用
 systemd 服务（`systemctl` 管理，`Restart=always`）。
 
-服务启动后提供以下接口：
+服务启动后提供以下接口（`/api/*` 均支持可选参数 `?service=<id|all>`，
+缺省或 `all` 为全部服务聚合视图，未知 id 返回 404）：
 
 - `GET /` 和 `GET /index.html`：性能看板页面。
 - `GET /usage.html`：用量统计页面。
 - `GET /api/metrics`：当前规范化指标及健康状态，始终返回 JSON。
+- `GET /api/services`：已配置服务列表（id、显示名、指标地址、健康状态）。
 - `GET /api/health`：看板采集健康状态；上游不可用时返回 HTTP 503。
-- `GET /api/raw`：最近一次原始 Prometheus 文本，默认禁用。
+- `GET /api/raw?service=<id>`：最近一次原始 Prometheus 文本，默认禁用，
+  仅支持具体服务（聚合无对应单一文本）。
 - `GET /api/usage`：用量统计完整数据（累计值 + 历史分段）。
 - `GET /api/usage/history`：仅历史分段序列。
 - `GET /api/usage/health`：用量写入健康状态（`last_error` / `last_write_at`）。
@@ -124,18 +131,47 @@ systemd 服务（`systemctl` 管理，`Restart=always`）。
 | `ENABLE_RAW_API` | `false` | 设为 `true`/`1` 后开放 `/api/raw` |
 | `ENABLE_USAGE_STATS` | `true` | 用量统计插件开关，设为 `false`/`0` 关闭 |
 | `USAGE_WRITE_INTERVAL_SECONDS` | `60` | 用量 CSV 写入间隔，允许 1–86400s |
-| `USAGE_DATA_DIR` | `usage_data/` | 用量 CSV 输出目录 |
+| `USAGE_DATA_DIR` | `usage_data/` | 用量 CSV 输出基础目录（实际按服务写入 `<目录>/<id>/`） |
 | `USAGE_PRICING_FILE` | `pricing.yaml` | 模型价格文件 |
+| `SERVICES_FILE` | `services.yaml` | 多服务配置文件（脚本同目录） |
 
 前端读取的是后端内存快照，不会因多个浏览器页面而成倍抓取推理服务。通常无需
 把 `POLL_INTERVAL_MS` 调到 200ms 以下。
 
+## 多服务监测
+
+默认读取脚本同目录的 `services.yaml`（可用 `SERVICES_FILE` 覆盖）。每个服务
+由内部 id 标识，id 同时用作用量数据目录名（`usage_data/<id>/`）和 API 的
+`?service=` 取值：
+
+```yaml
+services:
+  - id: antlserver01        # 必填，唯一，仅允许 [A-Za-z0-9._-]
+    name: antlserver01      # 可选，页面显示名，缺省同 id
+    metrics_url: http://127.0.0.1:8000/metrics
+  - id: siton02
+    name: siton02
+    metrics_url: http://10.171.22.152:8000/metrics
+```
+
+- 文件不存在或无条目时回退为单服务模式：仅监听 `INFERENCE_METRICS_URL`，
+  id 为 `default`，行为与旧版本一致。
+- 性能页面与用量页面顶部均可在"全部聚合"与单个服务之间切换，选择保存在
+  浏览器本地；切换后趋势图从该视图的服务端历史重新填充。
+- 聚合口径：请求数、tokens、速率与累计值求和；KV Cache 使用率取最大；
+  前缀缓存命中率按各服务窗口内增量求和后重算；E2E/TTFT/ITL/TPOT/queue
+  分位数用窗口内新增 Histogram 分桶跨服务合并后重算（要求分桶边界一致，
+  不同 vLLM 版本无法合并时显示 `--`）。某服务离线时其计数按 0 计，健康
+  状态按最差服务显示，错误信息带服务 id 前缀。
+- 用量统计按服务分目录写入 `usage_data/<id>/usage-YYYY-MM-DD.csv`；聚合
+  视图的累计值为各服务求和，趋势图按 60 秒时间桶对齐求和。
+
 ## 用量统计
 
 用量统计插件默认开启。它按 `USAGE_WRITE_INTERVAL_SECONDS`（默认 60 秒）
-把推理服务累计 Counter 的增量写入 `usage_data/usage-YYYY-MM-DD.csv`，
-每行代表上一写入周期内的新增用量，并附带按 `pricing.yaml` 计算的
-input/output/total 费用。
+把推理服务累计 Counter 的增量写入 `usage_data/<id>/usage-YYYY-MM-DD.csv`
+（每个服务一个子目录，见"多服务监测"），每行代表上一写入周期内的新增
+用量，并附带按 `pricing.yaml` 计算的 input/output/total 费用。
 
 - 网页顶部卡片显示累计值（由全部历史 CSV 求和，重启后继续累计）：
   请求数、输入/输出/总 tokens、累计费用、当前模型（超长自动滚动）。

@@ -17,4 +17,5 @@ venv/
 .DS_Store
 
 # Runtime usage exports (keep the directory itself available in deployments).
-usage_data/*.csv
+# Usage CSVs live in per-service subdirectories: usage_data/<id>/usage-*.csv
+usage_data/**/*.csv

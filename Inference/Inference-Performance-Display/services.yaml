@@ -1,0 +1,15 @@
+# Inference services monitored by the dashboard.
+#
+# - id:          internal identifier; must be unique and filesystem-safe.
+#                It is used as the usage data directory (usage_data/<id>/)
+#                and as the ?service= value in API queries.
+# - name:        display name shown in the web UI (defaults to id).
+# - metrics_url: Prometheus metrics endpoint of the running inference service.
+#
+services:
+  - id: antlserver01
+    name: antlserver01
+    metrics_url: http://127.0.0.1:8000/metrics
+  - id: siton02
+    name: siton02
+    metrics_url: http://10.171.22.152:8000/metrics

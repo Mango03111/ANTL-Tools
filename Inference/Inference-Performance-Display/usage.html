@@ -304,6 +304,9 @@
       <div class="panel">
         <div class="panel-head">
           <div class="sub" id="trend-sub">左轴：输入 tokens / 写入周期　右轴：输出 tokens / 写入周期　横轴：时间段</div>
+          <select id="service-select" aria-label="服务选择">
+            <option value="all" selected>全部聚合</option>
+          </select>
           <select id="trend-range" aria-label="趋势时间范围">
             <option value="60" selected>近一小时</option>
             <option value="720">近12小时</option>
@@ -346,6 +349,7 @@
       let rangeMinutes = 60;
       let lastText = null;
       let lastWidth = null;
+      let service = "all";
 
       // Per-range display settings: long windows use a trailing moving average
       // so compressed 1-minute noise reads as a smooth trend; 1h stays raw.
@@ -516,7 +520,7 @@
 
       async function poll() {
         try {
-          const r = await fetch("/api/usage", { cache: "no-store" });
+          const r = await fetch(`/api/usage?service=${encodeURIComponent(service)}`, { cache: "no-store" });
           const p = await r.json();
           if (!r.ok) throw new Error(p.error || "统计功能不可用");
           const u = p.usage || {};
@@ -544,13 +548,46 @@
         draw();
       });
 
+      async function loadServices() {
+        const select = $("service-select");
+        let valid = new Set(["all"]);
+        try {
+          const r = await fetch("/api/services", { cache: "no-store" });
+          if (r.ok) {
+            const p = await r.json();
+            for (const item of p?.services || []) {
+              if (!item?.id) continue;
+              const opt = document.createElement("option");
+              opt.value = item.id;
+              opt.textContent = item.name || item.id;
+              select.appendChild(opt);
+              valid.add(item.id);
+            }
+          }
+        } catch (_e) {
+          // Stay on the aggregate view when the service list is unavailable.
+        }
+        let saved = "all";
+        try { saved = localStorage.getItem("usage-dashboard-service") || "all"; } catch (_e) {}
+        select.value = valid.has(saved) ? saved : "all";
+        service = select.value;
+        try { localStorage.setItem("usage-dashboard-service", service); } catch (_e) {}
+      }
+
+      $("service-select").addEventListener("change", e => {
+        service = e.target.value || "all";
+        try { localStorage.setItem("usage-dashboard-service", service); } catch (_e) {}
+        history = [];
+        poll();
+      });
+
       $("trend-range").addEventListener("change", e => {
         rangeMinutes = Number(e.target.value) || 60;
         $("trend-sub").textContent = RANGE_META[rangeMinutes].sub;
         draw();
       });
 
-      poll();
+      loadServices().then(poll);
       setInterval(poll, 2000);
     })();
   </script>

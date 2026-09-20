@@ -15,7 +15,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Sequence
@@ -40,6 +40,7 @@ DEFAULT_USAGE_WRITE_INTERVAL_SECONDS = 60.0
 _BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_USAGE_DATA_DIR = _BASE_DIR / "usage_data"
 DEFAULT_USAGE_PRICING_FILE = _BASE_DIR / "pricing.yaml"
+DEFAULT_SERVICES_FILE = _BASE_DIR / "services.yaml"
 
 
 _SAMPLE_NAME_RE = re.compile(r"[a-zA-Z_:][a-zA-Z0-9_:]*")
@@ -70,6 +71,7 @@ class Config:
     usage_write_interval_seconds: float
     usage_data_dir: Path
     usage_pricing_file: Path
+    services_file: Path
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -103,6 +105,7 @@ class Config:
             usage_write_interval_seconds=_env_float("USAGE_WRITE_INTERVAL_SECONDS", DEFAULT_USAGE_WRITE_INTERVAL_SECONDS, minimum=1.0, maximum=86400.0),
             usage_data_dir=Path(os.getenv("USAGE_DATA_DIR", DEFAULT_USAGE_DATA_DIR)),
             usage_pricing_file=Path(os.getenv("USAGE_PRICING_FILE", DEFAULT_USAGE_PRICING_FILE)),
+            services_file=Path(os.getenv("SERVICES_FILE", DEFAULT_SERVICES_FILE)),
         )
 
 
@@ -138,6 +141,66 @@ def _env_bool(name: str, default: bool) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"{name} must be true/false, got {raw!r}")
+
+
+@dataclass(frozen=True)
+class ServiceSpec:
+    id: str
+    name: str
+    metrics_url: str
+
+
+_SERVICE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+def load_services(path: Path) -> list[ServiceSpec]:
+    """Parse the minimal services.yaml format: a `services:` list whose
+    entries carry `id`, optional `name`, and `metrics_url` fields.
+    """
+    if not path.is_file():
+        return []
+    entries: list[dict[str, str]] = []
+    current: dict[str, str] | None = None
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.rstrip(":") == "services":
+            continue
+        if line == "-" or line.startswith("- "):
+            current = {}
+            entries.append(current)
+            line = line[1:].strip()
+            if not line:
+                continue
+        if current is None:
+            raise ValueError(f"unexpected line outside services entries: {line!r}")
+        if ":" not in line:
+            raise ValueError(f"cannot parse services entry line: {line!r}")
+        key, value = (part.strip().strip("'\"") for part in line.split(":", 1))
+        if not key:
+            raise ValueError(f"cannot parse services entry line: {raw_line!r}")
+        current[key] = value
+    specs: list[ServiceSpec] = []
+    seen_ids: set[str] = set()
+    for entry in entries:
+        service_id = entry.get("id", "")
+        if not _SERVICE_ID_RE.fullmatch(service_id):
+            raise ValueError(f"missing or invalid 'id' in services entry: {entry!r}")
+        if service_id in seen_ids:
+            raise ValueError(f"duplicate service id: {service_id!r}")
+        seen_ids.add(service_id)
+        metrics_url = entry.get("metrics_url", "")
+        if not metrics_url.startswith(("http://", "https://")):
+            raise ValueError(f"service {service_id!r}: invalid metrics_url: {metrics_url!r}")
+        specs.append(
+            ServiceSpec(
+                id=service_id,
+                name=entry.get("name") or service_id,
+                metrics_url=metrics_url,
+            )
+        )
+    return specs
 
 
 def parse_prometheus_text(text: str) -> dict[str, list[Sample]]:
@@ -450,8 +513,6 @@ class MetricsCollector:
         self.config = config
         self._state_lock = threading.RLock()
         self._collect_lock = threading.Lock()
-        self._stop_event = threading.Event()
-        self._thread: threading.Thread | None = None
         self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         self._counter_history: deque[
             tuple[float, dict[str, dict[SeriesKey, float]]]
@@ -469,32 +530,16 @@ class MetricsCollector:
         self._last_error: str | None = None
         self._consecutive_failures = 0
         self._display_history: deque[dict[str, object]] = deque(maxlen=720)
+        self._last_latency_delta_histograms: dict[str, dict[float, float] | None] = {}
         self.usage = UsageStatsPlugin(config.usage_data_dir, config.usage_pricing_file, config.usage_write_interval_seconds) if config.enable_usage_stats else None
 
     def start(self) -> None:
-        if self._thread is not None and self._thread.is_alive():
-            return
-        self._stop_event.clear()
         if self.usage:
             self.usage.start()
-        self._thread = threading.Thread(
-            target=self._run, name="vllm-metrics-poller", daemon=True
-        )
-        self._thread.start()
 
     def stop(self) -> None:
-        self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=self.config.fetch_timeout_seconds + 1.0)
         if self.usage:
             self.usage.stop()
-
-    def _run(self) -> None:
-        while not self._stop_event.is_set():
-            started = time.monotonic()
-            self.collect_once()
-            elapsed = time.monotonic() - started
-            self._stop_event.wait(max(0.0, self.config.poll_interval_seconds - elapsed))
 
     def collect_once(self) -> dict[str, object]:
         with self._collect_lock:
@@ -506,13 +551,14 @@ class MetricsCollector:
                 parsed = parse_prometheus_text(raw_metrics)
                 if not any(name.startswith("vllm:") for name in parsed):
                     raise ValueError("metrics response contains no vllm:* samples")
-                payload = self._build_payload(parsed, attempted_at)
+                payload, delta_histograms = self._build_payload(parsed, attempted_at)
             except Exception as exc:  # A failed scrape must not stop the server.
                 self._record_error(exc)
                 return self.snapshot()
 
             with self._state_lock:
                 self._payload = payload
+                self._last_latency_delta_histograms = delta_histograms
                 self._raw_metrics = raw_metrics
                 self._last_success_at = attempted_at
                 self._last_error = None
@@ -562,12 +608,13 @@ class MetricsCollector:
         self._counter_history.clear()
         self._histogram_history.clear()
         with self._state_lock:
+            self._last_latency_delta_histograms = {}
             self._last_error = message[:500]
             self._consecutive_failures += 1
 
     def _build_payload(
         self, metrics: Mapping[str, Sequence[Sample]], sampled_at: float
-    ) -> dict[str, object]:
+    ) -> tuple[dict[str, object], dict[str, dict[float, float] | None]]:
         monotonic_now = time.monotonic()
         counter_series = {
             key: series
@@ -590,7 +637,8 @@ class MetricsCollector:
         self._prune_history(
             self._histogram_history, self.config.latency_window_seconds
         )
-        latency = self._latency_values()
+        delta_histograms = self._latency_delta_histograms()
+        latency = self._latency_quantiles(delta_histograms)
 
         model_names = sorted(
             {
@@ -661,6 +709,8 @@ class MetricsCollector:
                     ("vllm:kv_cache_usage_perc", "vllm:gpu_cache_usage_perc"),
                 ),
                 "prefix_cache_hit_rate": prefix_rate,
+                "prefix_queries_delta": prefix_queries_delta,
+                "prefix_hits_delta": prefix_hits_delta,
                 "prefix_cache_queries_total": counters.get("prefix_queries"),
                 "prefix_cache_hits_total": counters.get("prefix_hits"),
             },
@@ -670,7 +720,7 @@ class MetricsCollector:
                 "metric_families": len(metrics),
                 "samples": sum(len(samples) for samples in metrics.values()),
             },
-        }
+        }, delta_histograms
 
     @staticmethod
     def _prune_history(history: deque, window_seconds: float) -> None:
@@ -722,31 +772,15 @@ class MetricsCollector:
                 rates[key] = total_rate
         return rates, deltas
 
-    def _latency_values(self) -> dict[str, float | int | None]:
-        result: dict[str, float | int | None] = {
-            "e2e_p50": None,
-            "e2e_p90": None,
-            "e2e_p99": None,
-            "e2e_samples": 0,
-            "ttft_p50": None,
-            "ttft_p90": None,
-            "ttft_p99": None,
-            "ttft_samples": 0,
-            "itl_p50": None,
-            "itl_p90": None,
-            "itl_p99": None,
-            "itl_samples": 0,
-            "tpot_p50": None,
-            "tpot_p90": None,
-            "tpot_p99": None,
-            "tpot_samples": 0,
-            "queue_p50": None,
-            "queue_p90": None,
-            "queue_p99": None,
-            "queue_samples": 0,
-        }
+    def _latency_delta_histograms(self) -> dict[str, dict[float, float] | None]:
+        """Windowed new-sample bucket deltas per histogram metric.
+
+        One entry per metric present in the latest scrape; the value is None
+        when no usable windowed samples exist for that metric.
+        """
+        deltas: dict[str, dict[float, float] | None] = {}
         if len(self._histogram_history) < 2:
-            return result
+            return deltas
 
         _, current = self._histogram_history[-1]
         previous_entries = list(self._histogram_history)[:-1]
@@ -773,8 +807,36 @@ class MetricsCollector:
                     later_buckets = old_buckets
                 if baseline_delta is not None:
                     series_deltas.append(baseline_delta)
+            deltas[name] = _aggregate_histograms(series_deltas)
+        return deltas
 
-            delta_buckets = _aggregate_histograms(series_deltas)
+    @staticmethod
+    def _latency_quantiles(
+        delta_histograms: Mapping[str, dict[float, float] | None]
+    ) -> dict[str, float | int | None]:
+        result: dict[str, float | int | None] = {
+            "e2e_p50": None,
+            "e2e_p90": None,
+            "e2e_p99": None,
+            "e2e_samples": 0,
+            "ttft_p50": None,
+            "ttft_p90": None,
+            "ttft_p99": None,
+            "ttft_samples": 0,
+            "itl_p50": None,
+            "itl_p90": None,
+            "itl_p99": None,
+            "itl_samples": 0,
+            "tpot_p50": None,
+            "tpot_p90": None,
+            "tpot_p99": None,
+            "tpot_samples": 0,
+            "queue_p50": None,
+            "queue_p90": None,
+            "queue_p99": None,
+            "queue_samples": 0,
+        }
+        for name, delta_buckets in delta_histograms.items():
             if delta_buckets is None:
                 continue
             sample_count = delta_buckets[math.inf]
@@ -786,6 +848,9 @@ class MetricsCollector:
                     quantile, delta_buckets
                 )
         return result
+
+    def _latency_values(self) -> dict[str, float | int | None]:
+        return self._latency_quantiles(self._latency_delta_histograms())
 
     def snapshot(self) -> dict[str, object]:
         with self._state_lock:
@@ -826,6 +891,13 @@ class MetricsCollector:
         with self._state_lock:
             return self._raw_metrics
 
+    def latency_delta_histograms(self) -> dict[str, dict[float, float] | None]:
+        with self._state_lock:
+            return {
+                name: dict(buckets) if buckets is not None else None
+                for name, buckets in self._last_latency_delta_histograms.items()
+            }
+
     def _empty_payload(self) -> dict[str, object]:
         return {
             "api_version": 1,
@@ -856,6 +928,8 @@ class MetricsCollector:
             "cache": {
                 "kv_cache_usage": None,
                 "prefix_cache_hit_rate": None,
+                "prefix_queries_delta": None,
+                "prefix_hits_delta": None,
                 "prefix_cache_queries_total": None,
                 "prefix_cache_hits_total": None,
             },
@@ -863,6 +937,394 @@ class MetricsCollector:
             "health": {},
             "diagnostics": {"metric_families": 0, "samples": 0},
         }
+
+
+_STATUS_RANK = {"online": 0, "degraded": 1, "starting": 1, "stale": 2, "offline": 3}
+_LATENCY_METRIC_NAMES = ("e2e", "ttft", "itl", "tpot", "queue")
+_USAGE_TOTAL_KEYS = (
+    "requests",
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "input_cost",
+    "output_cost",
+    "total_cost",
+)
+
+
+class ServiceRegistry:
+    """Owns one MetricsCollector per configured service plus the shared poll loop.
+
+    A ``service`` argument of ``None``, ``""`` or ``"all"`` selects the
+    aggregated view across every configured service.
+    """
+
+    def __init__(self, config: Config, services: Sequence[ServiceSpec]):
+        self.config = config
+        self.services: list[ServiceSpec] = list(services)
+        self.collectors: dict[str, MetricsCollector] = {}
+        for spec in self.services:
+            service_config = replace(
+                config,
+                metrics_url=spec.metrics_url,
+                usage_data_dir=config.usage_data_dir / spec.id,
+            )
+            self.collectors[spec.id] = MetricsCollector(service_config)
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._aggregate_history: deque[dict[str, object]] = deque(maxlen=720)
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        for collector in self.collectors.values():
+            collector.start()
+        self._thread = threading.Thread(
+            target=self._run, name="vllm-metrics-poller", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(
+                timeout=self.config.fetch_timeout_seconds * max(1, len(self.services)) + 1.0
+            )
+        for collector in self.collectors.values():
+            collector.stop()
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            started = time.monotonic()
+            for collector in self.collectors.values():
+                if self._stop_event.is_set():
+                    break
+                collector.collect_once()
+            self._append_aggregate_point()
+            elapsed = time.monotonic() - started
+            self._stop_event.wait(max(0.0, self.config.poll_interval_seconds - elapsed))
+
+    # -- lookups ----------------------------------------------------------
+
+    def _resolve(self, service: str) -> MetricsCollector:
+        collector = self.collectors.get(service)
+        if collector is None:
+            raise KeyError(service)
+        return collector
+
+    def metrics_payload(self, service: str | None) -> dict[str, object]:
+        if service in (None, "", "all"):
+            return self._aggregate_metrics_payload()
+        return self._resolve(service).snapshot()
+
+    def usage_payload(self, service: str | None) -> dict[str, object]:
+        if service in (None, "", "all"):
+            return self._aggregate_usage_payload()
+        collector = self._resolve(service)
+        if collector.usage is None:
+            return {"ok": False, "error": "usage statistics are disabled"}
+        return collector.usage.api_payload()
+
+    def raw_metrics(self, service: str) -> str:
+        return self._resolve(service).raw_metrics()
+
+    def services_info(self) -> list[dict[str, object]]:
+        info: list[dict[str, object]] = []
+        for spec in self.services:
+            snapshot = self.collectors[spec.id].snapshot()
+            info.append(
+                {
+                    "id": spec.id,
+                    "name": spec.name,
+                    "url": spec.metrics_url,
+                    "status": snapshot["health"]["status"],
+                    "ok": bool(snapshot["ok"]),
+                }
+            )
+        return info
+
+    # -- aggregation -------------------------------------------------------
+
+    @staticmethod
+    def _sum_values(values: Iterable[float | None]) -> float | None:
+        present = [value for value in values if value is not None]
+        return sum(present) if present else None
+
+    @staticmethod
+    def _max_value(values: Iterable[float | None]) -> float | None:
+        present = [value for value in values if value is not None]
+        return max(present) if present else None
+
+    def _aggregate_latency(self) -> dict[str, float | int | None]:
+        per_service = [
+            collector.latency_delta_histograms() for collector in self.collectors.values()
+        ]
+        result: dict[str, float | int | None] = {}
+        for name in _LATENCY_METRIC_NAMES:
+            merged = _aggregate_histograms(
+                [deltas[name] for deltas in per_service if deltas.get(name) is not None]
+            )
+            if merged is None or merged[math.inf] <= 0:
+                result[f"{name}_samples"] = 0
+                result[f"{name}_p50"] = None
+                result[f"{name}_p90"] = None
+                result[f"{name}_p99"] = None
+                continue
+            sample_count = merged[math.inf]
+            result[f"{name}_samples"] = int(max(0.0, sample_count))
+            for label, quantile in (("p50", 0.50), ("p90", 0.90), ("p99", 0.99)):
+                result[f"{name}_{label}"] = histogram_quantile(quantile, merged)
+        return result
+
+    def _aggregate_metrics_payload(self) -> dict[str, object]:
+        snapshots = [collector.snapshot() for collector in self.collectors.values()]
+
+        models: list[str] = []
+        for snapshot in snapshots:
+            for model in snapshot.get("models", []):
+                if model not in models:
+                    models.append(model)
+
+        def total(section: str, key: str) -> float | None:
+            return self._sum_values([snapshot[section][key] for snapshot in snapshots])
+
+        requests_payload = {
+            key: total("requests", key)
+            for key in (
+                "running",
+                "waiting",
+                "waiting_capacity",
+                "waiting_deferred",
+                "swapped",
+                "requests_per_sec",
+                "completed_total",
+                "preemptions_total",
+            )
+        }
+        tokens_payload = {
+            key: total("tokens", key)
+            for key in (
+                "prompt_tokens_per_sec",
+                "generation_tokens_per_sec",
+                "prompt_tokens_total",
+                "generation_tokens_total",
+            )
+        }
+
+        queries_delta = total("cache", "prefix_queries_delta")
+        hits_delta = total("cache", "prefix_hits_delta")
+        prefix_rate = None
+        if (
+            queries_delta is not None
+            and hits_delta is not None
+            and queries_delta > 0
+            and 0 <= hits_delta <= queries_delta
+        ):
+            prefix_rate = hits_delta / queries_delta
+
+        health_sources = [snapshot["health"] for snapshot in snapshots]
+        status = max(
+            (str(health.get("status", "offline")) for health in health_sources),
+            key=lambda name: _STATUS_RANK.get(name, 3),
+        )
+        errors = [
+            f"{spec.id}: {health['last_error']}"
+            for spec, health in zip(self.services, health_sources)
+            if health.get("last_error")
+        ]
+        successes = [
+            health["last_success_at"]
+            for health in health_sources
+            if health.get("last_success_at") is not None
+        ]
+        last_success_at = min(successes) if successes else None
+        timestamps = [
+            snapshot["timestamp"] for snapshot in snapshots if snapshot.get("timestamp") is not None
+        ]
+        now = time.time()
+        sample_age = None if last_success_at is None else max(0.0, now - last_success_at)
+        stale = last_success_at is None or sample_age > self.config.stale_after_seconds
+        ok = all(snapshot["ok"] for snapshot in snapshots) and not stale
+
+        return {
+            "api_version": snapshots[0]["api_version"],
+            "ok": ok,
+            "timestamp": min(timestamps) if timestamps else None,
+            "source": ", ".join(spec.metrics_url for spec in self.services),
+            "poll_interval_ms": snapshots[0]["poll_interval_ms"],
+            "rate_window_seconds": snapshots[0]["rate_window_seconds"],
+            "latency_window_seconds": snapshots[0]["latency_window_seconds"],
+            "model": ", ".join(models) if models else "unknown",
+            "models": models,
+            "requests": requests_payload,
+            "tokens": tokens_payload,
+            "cache": {
+                "kv_cache_usage": self._max_value(
+                    [snapshot["cache"]["kv_cache_usage"] for snapshot in snapshots]
+                ),
+                "prefix_cache_hit_rate": prefix_rate,
+                "prefix_queries_delta": queries_delta,
+                "prefix_hits_delta": hits_delta,
+                "prefix_cache_queries_total": total("cache", "prefix_cache_queries_total"),
+                "prefix_cache_hits_total": total("cache", "prefix_cache_hits_total"),
+            },
+            "latency": self._aggregate_latency(),
+            "health": {
+                "status": status,
+                "last_error": "; ".join(errors) or None,
+                "last_attempt_at": max(
+                    (
+                        health["last_attempt_at"]
+                        for health in health_sources
+                        if health.get("last_attempt_at") is not None
+                    ),
+                    default=None,
+                ),
+                "last_success_at": last_success_at,
+                "sample_age_seconds": sample_age,
+                "stale": stale,
+                "stale_after_seconds": self.config.stale_after_seconds,
+                "consecutive_failures": max(
+                    (int(health.get("consecutive_failures") or 0) for health in health_sources),
+                    default=0,
+                ),
+            },
+            "diagnostics": {
+                "metric_families": sum(
+                    int(snapshot.get("diagnostics", {}).get("metric_families") or 0)
+                    for snapshot in snapshots
+                ),
+                "samples": sum(
+                    int(snapshot.get("diagnostics", {}).get("samples") or 0)
+                    for snapshot in snapshots
+                ),
+            },
+            "history": list(self._aggregate_history),
+        }
+
+    def _append_aggregate_point(self) -> None:
+        snapshots = [collector.snapshot() for collector in self.collectors.values()]
+        if not all(snapshot["ok"] for snapshot in snapshots):
+            return
+        latency = self._aggregate_latency()
+        self._aggregate_history.append(
+            {
+                "timestamp": time.time(),
+                "generation": self._sum_values(
+                    [s["tokens"]["generation_tokens_per_sec"] for s in snapshots]
+                ),
+                "prompt": self._sum_values(
+                    [s["tokens"]["prompt_tokens_per_sec"] for s in snapshots]
+                ),
+                "running": self._sum_values([s["requests"]["running"] for s in snapshots]),
+                "waiting": self._sum_values([s["requests"]["waiting"] for s in snapshots]),
+                "kv": self._max_value(
+                    [s["cache"]["kv_cache_usage"] for s in snapshots]
+                ),
+                "e2e_p50": latency["e2e_p50"],
+                "e2e_p90": latency["e2e_p90"],
+                "e2e_p99": latency["e2e_p99"],
+            }
+        )
+
+    def _aggregate_usage_payload(self) -> dict[str, object]:
+        entries = [
+            (spec.id, self.collectors[spec.id].usage.api_payload())
+            for spec in self.services
+            if self.collectors[spec.id].usage is not None
+        ]
+        if not entries:
+            return {"ok": False, "error": "usage statistics are disabled"}
+
+        totals = {key: 0.0 for key in _USAGE_TOTAL_KEYS}
+        period_totals = {key: 0.0 for key in _USAGE_TOTAL_KEYS}
+        models: list[str] = []
+        last_write_at: float | None = None
+        max_duration = 0.0
+        errors: list[str] = []
+        first_usage = entries[0][1]["usage"]
+        for service_id, payload in entries:
+            usage = payload["usage"]
+            period = usage.get("current_period") or {}
+            for key in totals:
+                totals[key] += float(usage.get(key) or 0.0)
+                period_totals[key] += float(period.get(key) or 0.0)
+            max_duration = max(max_duration, float(period.get("duration_seconds") or 0.0))
+            model = str(usage.get("model") or "")
+            if model and model != "unknown" and model not in models:
+                models.append(model)
+            last_write = usage.get("last_write_at")
+            if last_write is not None:
+                last_write_at = max(last_write_at or 0.0, float(last_write))
+            if usage.get("last_error"):
+                errors.append(f"{service_id}: {usage['last_error']}")
+
+        model_display = ", ".join(models) or "unknown"
+        price_fields = {
+            "input_price_per_1m_tokens": float(
+                first_usage.get("input_price_per_1m_tokens") or 0.0
+            ),
+            "output_price_per_1m_tokens": float(
+                first_usage.get("output_price_per_1m_tokens") or 0.0
+            ),
+            "currency": first_usage.get("currency", "USD"),
+        }
+        return {
+            "ok": all(payload["ok"] for _, payload in entries),
+            "usage": {
+                **totals,
+                "model": model_display,
+                **price_fields,
+                "current_period": {
+                    **period_totals,
+                    "duration_seconds": max_duration,
+                    "model": model_display,
+                    **price_fields,
+                },
+                "updated_at": time.time(),
+                "data_dir": str(self.config.usage_data_dir),
+                "last_write_at": last_write_at,
+                "last_error": "; ".join(errors) or None,
+            },
+            "history": self._merge_usage_history(
+                [payload["history"] for _, payload in entries]
+            ),
+        }
+
+    @classmethod
+    def _merge_usage_history(
+        cls, histories: Sequence[Sequence[Mapping[str, object]]]
+    ) -> list[dict[str, object]]:
+        """Merge per-service 1-minute rows into one row per 60 s time bucket."""
+        merged: dict[int, dict[str, object]] = {}
+        for history in histories:
+            for row in history:
+                timestamp = row.get("timestamp")
+                if not isinstance(timestamp, (int, float)):
+                    continue
+                bucket = int(timestamp // 60)
+                entry = merged.get(bucket)
+                if entry is None:
+                    merged[bucket] = dict(row)
+                    continue
+                for key in _USAGE_TOTAL_KEYS:
+                    entry[key] = float(entry.get(key) or 0.0) + float(row.get(key) or 0.0)
+                entry["period_start"] = min(
+                    str(entry.get("period_start") or ""), str(row.get("period_start") or "")
+                )
+                entry["period_end"] = max(
+                    str(entry.get("period_end") or ""), str(row.get("period_end") or "")
+                )
+                entry["duration_seconds"] = max(
+                    float(entry.get("duration_seconds") or 0.0),
+                    float(row.get("duration_seconds") or 0.0),
+                )
+                if str(entry.get("model") or "") in ("", "unknown") and str(
+                    row.get("model") or ""
+                ) not in ("", "unknown"):
+                    entry["model"] = row.get("model")
+        return [merged[bucket] for bucket in sorted(merged)]
 
 
 _HISTOGRAM_EPSILON = 1e-9
@@ -934,18 +1396,38 @@ class DashboardHTTPServer(ThreadingHTTPServer):
 
 
 def make_handler(
-    collector: MetricsCollector, index_path: Path
+    registry: ServiceRegistry, index_path: Path
 ) -> type[BaseHTTPRequestHandler]:
     class DashboardHandler(BaseHTTPRequestHandler):
         server_version = "InferencePerformanceDisplay/1.0"
 
+        def _service_param(self) -> str | None:
+            query = urllib.parse.urlsplit(self.path).query
+            value = urllib.parse.parse_qs(query).get("service", [None])[0]
+            if value is None or value == "" or value == "all":
+                return None
+            return value
+
+        def _unknown_service(self, service: str | None) -> None:
+            self._send_json(
+                {"ok": False, "error": f"unknown service: {service}"}, status=404
+            )
+
         def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
             path = urllib.parse.urlsplit(self.path).path
+            service = self._service_param()
             if path == "/api/metrics":
-                self._send_json(collector.snapshot())
+                try:
+                    self._send_json(registry.metrics_payload(service))
+                except KeyError:
+                    self._unknown_service(service)
                 return
             if path == "/api/health":
-                payload = collector.snapshot()
+                try:
+                    payload = registry.metrics_payload(service)
+                except KeyError:
+                    self._unknown_service(service)
+                    return
                 status = 200 if payload["ok"] else 503
                 self._send_json(
                     {
@@ -958,22 +1440,40 @@ def make_handler(
                 )
                 return
             if path == "/api/raw":
-                if not collector.config.enable_raw_api:
+                if not registry.config.enable_raw_api:
                     self._send_json(
                         {"ok": False, "error": "raw API is disabled"}, status=404
                     )
                     return
+                if service is None:
+                    self._send_json(
+                        {"ok": False, "error": "raw API requires a specific service"},
+                        status=400,
+                    )
+                    return
+                try:
+                    raw = registry.raw_metrics(service)
+                except KeyError:
+                    self._unknown_service(service)
+                    return
                 self._send_bytes(
-                    collector.raw_metrics().encode("utf-8"),
+                    raw.encode("utf-8"),
                     "text/plain; charset=utf-8",
                     cache_control="no-store",
                 )
                 return
+            if path == "/api/services":
+                self._send_json({"ok": True, "services": registry.services_info()})
+                return
             if path in {"/api/usage", "/api/usage/history", "/api/usage/health"}:
-                if collector.usage is None:
-                    self._send_json({"ok": False, "error": "usage statistics are disabled"}, status=404)
+                try:
+                    usage_payload = registry.usage_payload(service)
+                except KeyError:
+                    self._unknown_service(service)
                     return
-                usage_payload = collector.usage.api_payload()
+                if "error" in usage_payload:
+                    self._send_json(usage_payload, status=404)
+                    return
                 self._send_json(usage_payload if path == "/api/usage" else ({"ok": usage_payload["ok"], "history": usage_payload["history"]} if path.endswith("/history") else {"ok": usage_payload["ok"], "usage": {"last_error": usage_payload["usage"]["last_error"], "last_write_at": usage_payload["usage"]["last_write_at"]}}))
                 return
             if path in {"/", "/index.html"}:
@@ -1079,16 +1579,25 @@ def main() -> int:
     except ValueError as exc:
         print(f"configuration error: {exc}", file=sys.stderr)
         return 2
+    try:
+        services = load_services(config.services_file)
+    except ValueError as exc:
+        print(f"services configuration error: {exc}", file=sys.stderr)
+        return 2
+    if not services:
+        services = [
+            ServiceSpec(id="default", name="default", metrics_url=config.metrics_url)
+        ]
 
     index_path = Path(__file__).resolve().with_name("index.html")
     if not index_path.is_file():
         print(f"missing frontend file: {index_path}", file=sys.stderr)
         return 2
 
-    collector = MetricsCollector(config)
+    registry = ServiceRegistry(config, services)
     try:
         server = DashboardHTTPServer(
-            (config.host, config.port), make_handler(collector, index_path)
+            (config.host, config.port), make_handler(registry, index_path)
         )
     except OSError as exc:
         print(f"cannot listen on {config.host}:{config.port}: {exc}", file=sys.stderr)
@@ -1100,9 +1609,10 @@ def main() -> int:
     signal.signal(signal.SIGINT, stop_on_signal)
     signal.signal(signal.SIGTERM, stop_on_signal)
 
-    collector.start()
+    registry.start()
     print(f"Dashboard: http://{config.host}:{config.port}/")
-    print(f"vLLM metrics: {config.metrics_url}")
+    for spec in services:
+        print(f"Service {spec.id}: {spec.metrics_url}")
     print(
         f"Polling every {config.poll_interval_seconds * 1000:.0f} ms; "
         f"rate window {config.rate_window_seconds:g} s; "
@@ -1114,7 +1624,7 @@ def main() -> int:
         print("Stopping dashboard...")
     finally:
         server.server_close()
-        collector.stop()
+        registry.stop()
     return 0
 
 

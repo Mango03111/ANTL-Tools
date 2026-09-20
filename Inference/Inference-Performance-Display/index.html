@@ -1486,6 +1486,12 @@
       </section>
 
       <div class="toolbar" aria-label="仪表盘控制">
+        <label class="select-control" for="service-select">
+          <span>服务</span>
+          <select id="service-select">
+            <option value="all" selected>全部聚合</option>
+          </select>
+        </label>
         <label class="select-control" for="refresh-interval">
           <span>刷新间隔</span>
           <select id="refresh-interval">
@@ -1775,6 +1781,7 @@
         errorAlert: document.getElementById("error-alert"),
         errorTitle: document.getElementById("error-title"),
         errorMessage: document.getElementById("error-message"),
+        serviceSelect: document.getElementById("service-select"),
         refreshInterval: document.getElementById("refresh-interval"),
         pauseButton: document.getElementById("pause-button"),
         clearButton: document.getElementById("clear-button"),
@@ -1803,6 +1810,7 @@
       }
 
       const state = {
+        service: "all",
         intervalMs: restoreInterval(),
         paused: false,
         inFlight: false,
@@ -1829,6 +1837,47 @@
         } catch (_error) {
           // The dashboard remains functional when storage is disabled.
         }
+      }
+
+      function restoreService() {
+        try {
+          return window.localStorage.getItem("vllm-dashboard-service") || "all";
+        } catch (_error) {
+          return "all";
+        }
+      }
+
+      function persistService(value) {
+        try {
+          window.localStorage.setItem("vllm-dashboard-service", value);
+        } catch (_error) {
+          // The dashboard remains functional when storage is disabled.
+        }
+      }
+
+      async function loadServices() {
+        const select = elements.serviceSelect;
+        let valid = new Set(["all"]);
+        try {
+          const response = await window.fetch("/api/services", { cache: "no-store" });
+          if (response.ok) {
+            const payload = await response.json();
+            for (const item of payload?.services || []) {
+              if (!item?.id) continue;
+              const option = document.createElement("option");
+              option.value = item.id;
+              option.textContent = item.name || item.id;
+              select.appendChild(option);
+              valid.add(item.id);
+            }
+          }
+        } catch (_error) {
+          // Stay on the aggregate view when the service list is unavailable.
+        }
+        const saved = restoreService();
+        select.value = valid.has(saved) ? saved : "all";
+        state.service = select.value;
+        persistService(state.service);
       }
 
       function numberAt(object, path) {
@@ -2349,7 +2398,9 @@
         const timeout = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
         try {
-          const response = await window.fetch("/api/metrics", {
+          const response = await window.fetch(
+            `/api/metrics?service=${encodeURIComponent(state.service)}`,
+            {
             method: "GET",
             headers: { Accept: "application/json" },
             cache: "no-store",
@@ -2391,6 +2442,16 @@
 
       elements.refreshInterval.value = String(state.intervalMs);
       elements.clientPoll.textContent = formatInterval(state.intervalMs);
+
+      elements.serviceSelect.addEventListener("change", () => {
+        state.service = elements.serviceSelect.value || "all";
+        persistService(state.service);
+        state.history.length = 0;
+        state.currentSnapshot = null;
+        renderCharts();
+        window.clearTimeout(state.timer);
+        if (!state.inFlight) fetchMetrics();
+      });
 
       elements.refreshInterval.addEventListener("change", () => {
         const selected = Number(elements.refreshInterval.value);
@@ -2436,7 +2497,7 @@
 
       requestAnimationFrame(() => {
         resizeCharts();
-        fetchMetrics();
+        loadServices().then(fetchMetrics);
       });
     })();
   </script>
