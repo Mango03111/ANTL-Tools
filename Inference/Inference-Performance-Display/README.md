@@ -30,6 +30,7 @@
   queue latency 的 p50/p90/p99。
 - Token 吞吐、请求并发、KV Cache 压力、端到端延迟四个趋势图，浏览器
   保留最近 60 秒趋势，支持暂停、清空以及 200ms/500ms/1s/2s 刷新间隔。
+- 当前视图最近 60 秒的趋势数据可导出为 UTF-8 CSV，便于离线分析和报告整理。
 - 推理服务不可达或数据过期时提供 在线 / 数据已陈旧 / 离线 状态。
 - 用量统计页面（`/usage.html`）：累计请求与 token 数、按模型价格计算的
   累计费用、当前模型（超长自动滚动），以及输入/输出 token 双纵轴趋势图，
@@ -108,6 +109,8 @@ systemd 服务（`systemctl` 管理，`Restart=always`）。
 - `GET /` 和 `GET /index.html`：性能看板页面。
 - `GET /usage.html`：用量统计页面。
 - `GET /api/metrics`：当前规范化指标及健康状态，始终返回 JSON。
+- `GET /api/metrics.csv`：导出当前视图最近 60 秒趋势数据，返回带 BOM 的
+  UTF-8 CSV；支持 `?service=<id|all>`。
 - `GET /api/services`：已配置服务列表（id、显示名、指标地址、健康状态）。
 - `GET /api/health`：看板采集健康状态；上游不可用时返回 HTTP 503。
 - `GET /api/raw?service=<id>`：最近一次原始 Prometheus 文本，默认禁用，
@@ -115,6 +118,14 @@ systemd 服务（`systemctl` 管理，`Restart=always`）。
 - `GET /api/usage`：用量统计完整数据（累计值 + 历史分段）。
 - `GET /api/usage/history`：仅历史分段序列。
 - `GET /api/usage/health`：用量写入健康状态（`last_error` / `last_write_at`）。
+
+## 测试
+
+趋势 CSV 单元测试仅使用 Python 标准库：
+
+```bash
+python3 -m unittest discover -s tests -v
+```
 
 ## 配置
 
