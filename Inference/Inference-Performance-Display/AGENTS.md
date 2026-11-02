@@ -52,8 +52,10 @@ curl -fsS http://127.0.0.1:8090/api/services                   # 服务列表与
 curl -fsS http://127.0.0.1:8090/api/health                     # 聚合健康（503 = 有上游不可达）
 curl -fsS "http://127.0.0.1:8090/api/metrics?service=all" | head -c 500
 curl -fsS "http://127.0.0.1:8090/api/metrics?service=antlserver01" | head -c 500
+curl -fsS -D - "http://127.0.0.1:8090/api/metrics.csv?service=all" | head -20
 curl -fsS http://127.0.0.1:8090/api/usage
 python3 -m py_compile server.py usage_stats.py                 # 语法检查
+python3 -m unittest discover -s tests -v                       # 标准库单元测试
 node --check <提取的页面内联 JS>                                 # 前端语法（可选）
 ```
 
@@ -81,7 +83,7 @@ node --check <提取的页面内联 JS>                                 # 前端
 - **健康状态机**：`starting / online / degraded / stale / offline`，
   超过 `STALE_AFTER_SECONDS` 未成功抓取即 stale
 - **HTTP 路由**（`make_handler`）：`/`、`/index.html`、`/usage.html`、
-  `/api/metrics`、`/api/health`、`/api/services`、`/api/raw`（默认禁用且需
+  `/api/metrics`、`/api/metrics.csv`、`/api/health`、`/api/services`、`/api/raw`（默认禁用且需
   具体服务，`ENABLE_RAW_API=true` 开启）、`/api/usage{,/history,/health}`、
   `/images/*`（有路径穿越防护）、`/favicon.ico`
 - **线程模型**：registry 单采集线程（串行轮询所有服务）+ `ThreadingHTTPServer`

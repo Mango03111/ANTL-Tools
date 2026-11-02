@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import copy
+import csv
+import io
 import json
 import math
 import os
@@ -16,6 +18,7 @@ import urllib.parse
 import urllib.request
 from collections import defaultdict, deque
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Sequence
@@ -1390,6 +1393,82 @@ def _histogram_delta(
     return delta
 
 
+_HISTORY_CSV_COLUMNS = (
+    "service",
+    "timestamp_unix",
+    "timestamp_iso",
+    "generation_tokens_per_sec",
+    "prompt_tokens_per_sec",
+    "running_requests",
+    "waiting_requests",
+    "kv_cache_usage_pct",
+    "e2e_p50_ms",
+    "e2e_p90_ms",
+    "e2e_p99_ms",
+)
+
+
+def history_csv(payload: Mapping[str, object], service: str | None) -> bytes:
+    """Render the current in-memory history as an Excel-friendly CSV."""
+    service_id = service or "all"
+    history = payload.get("history", [])
+    if not isinstance(history, list):
+        history = []
+
+    output = io.StringIO(newline="")
+    writer = csv.writer(output, lineterminator="\n")
+    writer.writerow(_HISTORY_CSV_COLUMNS)
+
+    for point in history:
+        if not isinstance(point, Mapping):
+            continue
+        timestamp = point.get("timestamp")
+        try:
+            timestamp_value = float(timestamp)
+        except (TypeError, ValueError):
+            timestamp_value = None
+
+        timestamp_iso = ""
+        if timestamp_value is not None and math.isfinite(timestamp_value):
+            timestamp_iso = datetime.fromtimestamp(
+                timestamp_value, tz=timezone.utc
+            ).isoformat().replace("+00:00", "Z")
+
+        kv = point.get("kv")
+        if isinstance(kv, (int, float)) and math.isfinite(kv):
+            kv = kv * 100
+        else:
+            kv = None
+
+        def milliseconds(value: object) -> object:
+            if isinstance(value, (int, float)) and math.isfinite(value):
+                return round(value * 1000, 6)
+            return None
+
+        e2e_p50 = milliseconds(point.get("e2e_p50"))
+        e2e_p90 = milliseconds(point.get("e2e_p90"))
+        e2e_p99 = milliseconds(point.get("e2e_p99"))
+        writer.writerow(
+            (
+                service_id,
+                timestamp_value if timestamp_value is not None else "",
+                timestamp_iso,
+                point.get("generation", ""),
+                point.get("prompt", ""),
+                point.get("running", ""),
+                point.get("waiting", ""),
+                kv if kv is not None else "",
+                e2e_p50 if e2e_p50 is not None else "",
+                e2e_p90 if e2e_p90 is not None else "",
+                e2e_p99 if e2e_p99 is not None else "",
+            )
+        )
+
+    # A UTF-8 BOM keeps Chinese-aware spreadsheet software from guessing the
+    # wrong encoding when users open the downloaded file directly.
+    return ("\ufeff" + output.getvalue()).encode("utf-8")
+
+
 class DashboardHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -1421,6 +1500,26 @@ def make_handler(
                     self._send_json(registry.metrics_payload(service))
                 except KeyError:
                     self._unknown_service(service)
+                return
+            if path == "/api/metrics.csv":
+                try:
+                    payload = registry.metrics_payload(service)
+                except KeyError:
+                    self._unknown_service(service)
+                    return
+                filename_service = re.sub(r"[^A-Za-z0-9._-]+", "-", service or "all")
+                filename = (
+                    f"metrics-{filename_service}-"
+                    f"{time.strftime('%Y%m%d-%H%M%S')}.csv"
+                )
+                self._send_bytes(
+                    history_csv(payload, service),
+                    "text/csv; charset=utf-8",
+                    cache_control="no-store",
+                    extra_headers={
+                        "Content-Disposition": f'attachment; filename="{filename}"'
+                    },
+                )
                 return
             if path == "/api/health":
                 try:
@@ -1527,6 +1626,7 @@ def make_handler(
             *,
             status: int = 200,
             cache_control: str,
+            extra_headers: Mapping[str, str] | None = None,
         ) -> None:
             self.send_response(status)
             self.send_header("Content-Type", content_type)
@@ -1541,6 +1641,8 @@ def make_handler(
                 "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
                 "connect-src 'self'; frame-ancestors 'none'",
             )
+            for name, value in (extra_headers or {}).items():
+                self.send_header(name, value)
             self.end_headers()
             self.wfile.write(body)
 
