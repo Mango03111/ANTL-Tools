@@ -6,9 +6,9 @@
 
 | # | 模块 | 简介 | 目录 |
 | :-: | :-- | :-- | :-- |
-| 1 | [TOR自动配置脚本（OVS-TOR）](#ovs-tor) | OVS 网桥初始化与 OpenFlow 流配置 | [OVS-TOR/](OVS-TOR/) |
-| 2 | [光交换机socket控制脚本（OCS-Sokect-Control）](#ocs-socket-control) | Polatis 光交换机串口控制 | [OCS-Sokect-Control/](OCS-Sokect-Control/) |
-| 3 | [APP流量生成脚本（APP）](#app) | 多机架流量生成 | [APP/](APP/) |
-| 4 | [推理相关脚本与工具（Inference）](#Inference) | 部署配置与性能监控 | [Inference/](Inference/) |
-| 5 | [CX系列网卡相关控制脚本（NIC control）](#NIC-control) | 命名空间隔离与静态 ARP配置 | [NIC control/](<NIC control/>) |
-| 6 | [Agent 服务管理脚本（Agent）](#agent) | Dify 服务的启动、停止与健康检查 | [Agent/](Agent/) |
+| 1 | [TOR自动配置脚本（tor-ovs）](#tor-ovs) | OVS 网桥初始化与 OpenFlow 流配置 | [tor-ovs/](tor-ovs/) |
+| 2 | [光交换机socket控制脚本（ocs-sokect-control）](#ocs-sokect-control) | Polatis 光交换机串口控制 | [ocs-sokect-control/](ocs-sokect-control/) |
+| 3 | [APP流量生成脚本（app）](#app) | 多机架流量生成 | [app/](app/) |
+| 4 | [推理相关脚本与工具（inference）](#inference) | 部署配置与性能监控 | [inference/](inference/) |
+| 5 | [CX系列网卡相关控制脚本（nic-control）](#nic-control) | 命名空间隔离与静态 ARP配置 | [nic-control/](nic-control/) |
+| 6 | [Agent 服务管理脚本（agent）](#agent) | Dify 服务的启动、停止与健康检查 | [agent/](agent/) |
