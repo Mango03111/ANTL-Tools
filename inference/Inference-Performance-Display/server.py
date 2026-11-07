@@ -38,7 +38,7 @@ DEFAULT_USAGE_WRITE_INTERVAL_SECONDS = 60.0
 # Resolve the usage data/pricing defaults relative to this script so the
 # server works no matter which directory it is started from.
 _BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_USAGE_DATA_DIR = _BASE_DIR / "usage_data"
+DEFAULT_USAGE_DATA_DIR = "usage_data/"
 DEFAULT_USAGE_PRICING_FILE = _BASE_DIR / "pricing.yaml"
 DEFAULT_SERVICES_FILE = _BASE_DIR / "services.yaml"
 
@@ -103,7 +103,7 @@ class Config:
             enable_raw_api=_env_bool("ENABLE_RAW_API", DEFAULT_ENABLE_RAW_API),
             enable_usage_stats=_env_bool("ENABLE_USAGE_STATS", DEFAULT_ENABLE_USAGE_STATS),
             usage_write_interval_seconds=_env_float("USAGE_WRITE_INTERVAL_SECONDS", DEFAULT_USAGE_WRITE_INTERVAL_SECONDS, minimum=1.0, maximum=86400.0),
-            usage_data_dir=Path(os.getenv("USAGE_DATA_DIR", DEFAULT_USAGE_DATA_DIR)),
+            usage_data_dir=(_BASE_DIR / Path(os.getenv("USAGE_DATA_DIR", DEFAULT_USAGE_DATA_DIR))).resolve(),
             usage_pricing_file=Path(os.getenv("USAGE_PRICING_FILE", DEFAULT_USAGE_PRICING_FILE)),
             services_file=Path(os.getenv("SERVICES_FILE", DEFAULT_SERVICES_FILE)),
         )

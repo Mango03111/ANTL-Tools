@@ -131,7 +131,7 @@ systemd 服务（`systemctl` 管理，`Restart=always`）。
 | `ENABLE_RAW_API` | `false` | 设为 `true`/`1` 后开放 `/api/raw` |
 | `ENABLE_USAGE_STATS` | `true` | 用量统计插件开关，设为 `false`/`0` 关闭 |
 | `USAGE_WRITE_INTERVAL_SECONDS` | `60` | 用量 CSV 写入间隔，允许 1–86400s |
-| `USAGE_DATA_DIR` | `usage_data/` | 用量 CSV 输出基础目录（实际按服务写入 `<目录>/<id>/`） |
+| `USAGE_DATA_DIR` | `usage_data/` | 相对于 server.py 所在目录解析，不受启动目录或外层改名影响；每服务写入 usage_data/<id>/ |
 | `USAGE_PRICING_FILE` | `pricing.yaml` | 模型价格文件 |
 | `SERVICES_FILE` | `services.yaml` | 多服务配置文件（脚本同目录） |
 
