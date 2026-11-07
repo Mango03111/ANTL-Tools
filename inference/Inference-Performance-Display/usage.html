@@ -363,6 +363,8 @@
       let lastText = null;
       let lastWidth = null;
       let service = "all";
+      let pollController = null;
+      const REQUEST_TIMEOUT_MS = 5_000;
 
       // Per-range display settings: long windows use a trailing moving average
       // so compressed 1-minute noise reads as a smooth trend; 1h stays raw.
@@ -532,9 +534,17 @@
       }
 
       async function poll() {
+        if (pollController) return;
+        const controller = new AbortController();
+        pollController = controller;
+        const timeout = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
         try {
-          const r = await fetch(`/api/usage?service=${encodeURIComponent(service)}`, { cache: "no-store" });
+          const r = await fetch(`/api/usage?service=${encodeURIComponent(service)}`, {
+            cache: "no-store",
+            signal: controller.signal
+          });
           const p = await r.json();
+          if (pollController !== controller) return;
           if (!r.ok) throw new Error(p.error || "统计功能不可用");
           const u = p.usage || {};
           $("requests").textContent = fmt(u.requests);
@@ -550,8 +560,14 @@
           $("error").textContent = u.last_error || "";
           draw();
         } catch (e) {
+          if (pollController !== controller) return;
           setStatus("offline", "离线");
-          $("error").textContent = e.message;
+          $("error").textContent = e?.name === "AbortError"
+            ? `请求超过 ${REQUEST_TIMEOUT_MS / 1000} 秒未响应`
+            : e.message;
+        } finally {
+          window.clearTimeout(timeout);
+          if (pollController === controller) pollController = null;
         }
       }
 
@@ -583,14 +599,28 @@
         let saved = "all";
         try { saved = localStorage.getItem("usage-dashboard-service") || "all"; } catch (_e) {}
         select.value = valid.has(saved) ? saved : "all";
-        service = select.value;
-        try { localStorage.setItem("usage-dashboard-service", service); } catch (_e) {}
+        setService(select.value);
+      }
+
+      function setService(selectedService) {
+        try { localStorage.setItem("usage-dashboard-service", selectedService); } catch (_e) {}
+        if (selectedService === service) return;
+        service = selectedService;
+        pollController?.abort();
+        pollController = null;
+        history = [];
+        for (const id of ["requests", "input", "output", "total", "cost", "model"]) {
+          $(id).textContent = "--";
+        }
+        $("model").title = "--";
+        $("error").textContent = "";
+        setStatus("connecting", "连接中");
+        updateModelScroll();
+        draw();
       }
 
       $("service-select").addEventListener("change", e => {
-        service = e.target.value || "all";
-        try { localStorage.setItem("usage-dashboard-service", service); } catch (_e) {}
-        history = [];
+        setService(e.target.value || "all");
         poll();
       });
 

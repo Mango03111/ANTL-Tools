@@ -1813,7 +1813,7 @@
         service: "all",
         intervalMs: restoreInterval(),
         paused: false,
-        inFlight: false,
+        inFlight: null,
         timer: null,
         history: [],
         currentSnapshot: null,
@@ -1876,8 +1876,7 @@
         }
         const saved = restoreService();
         select.value = valid.has(saved) ? saved : "all";
-        state.service = select.value;
-        persistService(state.service);
+        setService(select.value);
       }
 
       function numberAt(object, path) {
@@ -2080,6 +2079,13 @@
           hideAlert();
         }
 
+        renderMetricValues(snapshot);
+        if (!state.paused) {
+          recordSnapshot(snapshot);
+        }
+      }
+
+      function renderMetricValues(snapshot) {
         elements.source.textContent = snapshot.source || "--";
         elements.source.title = snapshot.source || "--";
         elements.model.textContent = snapshot.model || "--";
@@ -2106,10 +2112,6 @@
 
         for (const [key, cell] of Object.entries(latencyCells)) {
           cell.textContent = formatDuration(snapshot.latency[key]);
-        }
-
-        if (!state.paused) {
-          recordSnapshot(snapshot);
         }
       }
 
@@ -2393,8 +2395,8 @@
 
       async function fetchMetrics() {
         if (state.inFlight) return;
-        state.inFlight = true;
         const controller = new AbortController();
+        state.inFlight = controller;
         const timeout = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
         try {
@@ -2408,19 +2410,23 @@
           });
           if (!response.ok) throw new Error(`HTTP ${response.status} ${response.statusText}`.trim());
           const payload = await response.json();
+          if (state.inFlight !== controller) return;
           if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
             throw new Error("/api/metrics 返回了无效 JSON");
           }
           renderSnapshot(normalizePayload(payload));
         } catch (error) {
+          if (state.inFlight !== controller) return;
           const normalizedError = error?.name === "AbortError"
             ? new Error(`请求超过 ${REQUEST_TIMEOUT_MS / 1000} 秒未响应`)
             : error;
           renderTransportError(normalizedError);
         } finally {
           window.clearTimeout(timeout);
-          state.inFlight = false;
-          scheduleNextPoll();
+          if (state.inFlight === controller) {
+            state.inFlight = null;
+            scheduleNextPoll();
+          }
         }
       }
 
@@ -2443,14 +2449,26 @@
       elements.refreshInterval.value = String(state.intervalMs);
       elements.clientPoll.textContent = formatInterval(state.intervalMs);
 
-      elements.serviceSelect.addEventListener("change", () => {
-        state.service = elements.serviceSelect.value || "all";
-        persistService(state.service);
+      function setService(service) {
+        persistService(service);
+        if (service === state.service) return;
+        state.service = service;
+        window.clearTimeout(state.timer);
+        state.inFlight?.abort();
+        state.inFlight = null;
         state.history.length = 0;
         state.currentSnapshot = null;
+        state.chartNow = Date.now();
+        elements.dashboard.classList.remove("is-stale");
+        setConnection("connecting", "连接中");
+        hideAlert();
+        renderMetricValues(normalizePayload({}));
         renderCharts();
-        window.clearTimeout(state.timer);
-        if (!state.inFlight) fetchMetrics();
+      }
+
+      elements.serviceSelect.addEventListener("change", () => {
+        setService(elements.serviceSelect.value || "all");
+        fetchMetrics();
       });
 
       elements.refreshInterval.addEventListener("change", () => {
