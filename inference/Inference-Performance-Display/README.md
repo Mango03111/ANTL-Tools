@@ -37,6 +37,9 @@
   移动平均平滑）。
 - 多服务聚合：`services.yaml` 配置多个推理服务，性能与用量页面均可在
   "全部聚合"与单个服务之间切换（详见"多服务监测"）。
+- 性能历史持久化：每 10 秒把规范化指标快照写入 `metrics_data/metrics.db`
+  （SQLite，仅标准库），默认保留 7 天；提供只读历史查询 API，重启后仍可
+  回看过去的 running、KV、吞吐、TTFT、TPOT、queue 等指标。
 - 全部实现仅依赖 Python 标准库；不需要 Prometheus、Grafana、Node.js 或
   前端构建步骤。
 
@@ -102,12 +105,14 @@ python3 server.py
 重启自启，也不在进程崩溃后自动拉起；如需开机自启与崩溃自愈，请改用
 systemd 服务（`systemctl` 管理，`Restart=always`）。
 
-服务启动后提供以下接口（`/api/*` 均支持可选参数 `?service=<id|all>`，
-缺省或 `all` 为全部服务聚合视图，未知 id 返回 404）：
+服务启动后提供以下接口（除 `/api/metrics/history` 外，`/api/*` 均支持可选
+参数 `?service=<id|all>`，缺省或 `all` 为全部服务聚合视图，未知 id 返回 404）：
 
 - `GET /` 和 `GET /index.html`：性能看板页面。
 - `GET /usage.html`：用量统计页面。
 - `GET /api/metrics`：当前规范化指标及健康状态，始终返回 JSON。
+- `GET /api/metrics/history?service=<id>&minutes=60&step=10`：查询持久化
+  性能历史；仅支持具体服务 id，`all` 返回 400（详见"性能历史"）。
 - `GET /api/services`：已配置服务列表（id、显示名、指标地址、健康状态）。
 - `GET /api/health`：看板采集健康状态；上游不可用时返回 HTTP 503。
 - `GET /api/raw?service=<id>`：最近一次原始 Prometheus 文本，默认禁用，
@@ -133,6 +138,11 @@ systemd 服务（`systemctl` 管理，`Restart=always`）。
 | `USAGE_WRITE_INTERVAL_SECONDS` | `60` | 用量 CSV 写入间隔，允许 1–86400s |
 | `USAGE_DATA_DIR` | `usage_data/` | 相对于 server.py 所在目录解析，不受启动目录或外层改名影响；每服务写入 usage_data/<id>/ |
 | `USAGE_PRICING_FILE` | `pricing.yaml` | 模型价格文件 |
+| `ENABLE_METRICS_HISTORY` | `true` | 性能历史持久化开关，设为 `false`/`0` 关闭 |
+| `METRICS_HISTORY_DB` | `metrics_data/metrics.db` | 历史 SQLite 路径，相对 server.py 所在目录解析 |
+| `METRICS_HISTORY_INTERVAL_SECONDS` | `10` | 历史采样写入间隔，允许 1–300s |
+| `METRICS_HISTORY_RETENTION_DAYS` | `7` | 历史保留天数，允许 1–365 |
+| `METRICS_HISTORY_MAX_POINTS` | `5000` | 单次历史查询返回点数上限 |
 | `SERVICES_FILE` | `services.yaml` | 多服务配置文件（脚本同目录） |
 
 前端读取的是后端内存快照，不会因多个浏览器页面而成倍抓取推理服务。通常无需
@@ -165,6 +175,50 @@ services:
   状态按最差服务显示，错误信息带服务 id 前缀。
 - 用量统计按服务分目录写入 `usage_data/<id>/usage-YYYY-MM-DD.csv`；聚合
   视图的累计值为各服务求和，趋势图按 60 秒时间桶对齐求和。
+
+## 性能历史
+
+看板默认把采样得到的规范化性能快照持久化到 SQLite：
+
+- 数据路径：`metrics_data/metrics.db`（相对 `server.py`；`METRICS_HISTORY_DB`
+  可覆盖，目录自动创建，`metrics_data/` 已加入 `.gitignore`）。
+- 写入节奏：`ServiceRegistry` 的单个轮询线程每 10 秒最多写一条，只记录
+  `ok=true` 的成功抓取；主键 `(service_id, ts)`，重复时间戳用
+  `INSERT OR REPLACE` 覆盖。
+- 保留：默认 7 天，启动时清理一次，之后每 24 小时清理；写入/清理失败只记
+  日志，不会让监控退出。
+- 存储：每条记录包含 `model`、`requests`、`tokens`、`cache`、`latency`
+  的规范化字段；JSON 存储便于跟随 vLLM 指标演进，不需要频繁改表。
+- 数据量：10 秒一条约 8640 条/天/服务，7 天约 40–70 MB/服务（视字段值和
+  SQLite 页开销而定）。
+
+查询接口：
+
+```bash
+curl -sS 'http://127.0.0.1:8090/api/metrics/history?service=antlab-vllm&minutes=60&step=10'
+curl -sS 'http://127.0.0.1:8090/api/metrics/history?service=antlab-vllm&minutes=1440&step=60'
+```
+
+| 参数 | 必填 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `service` | 是 | — | 具体服务 id；第一版不支持 `all`（返回 400） |
+| `minutes` | 否 | `60` | 回看分钟数，1–1440 |
+| `step` | 否 | `10` | 聚合桶大小（秒），1–300 |
+
+返回 `{ok, service, from, to, step_seconds, count, samples}`；每个样本的
+`ts` 为桶起点，`time` 为本地时间 ISO 字符串。按 `step` 聚合时：数值字段取
+平均（缺失保持 `null`），`model` 取桶内最后一个非空值，`status` 取桶内最差
+状态（`offline > stale > degraded > starting > online`），空桶跳过。
+
+行为约定：
+
+- 未知服务 → 404；`service=all`、缺少 `service`、非法 `minutes`/`step` → 400；
+- 空历史 → 200 且 `samples: []`；
+- 估算点数超过 `METRICS_HISTORY_MAX_POINTS` → 400，提示增大 `step` 或缩小
+  `minutes`；
+- `ENABLE_METRICS_HISTORY=false` → 404；数据库不可用 → 503；
+- 只读接口，不提供 CSV 导出或写入接口；
+- 本版本不做前端历史图，历史数据通过 API/脚本读取。
 
 ## 用量统计
 

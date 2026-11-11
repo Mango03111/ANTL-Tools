@@ -6,8 +6,9 @@
 
 无第三方依赖的多推理（vLLM）服务性能监测看板。后端用 Python 标准库定时抓取
 `services.yaml` 配置的各推理服务 Prometheus 指标，支持"全部聚合 + 分服务"
-两种视图；前端为单文件 HTML/CSS/JS（无构建步骤），提供性能看板与用量统计
-两个页面，顶部均可切换聚合/单服务。
+两种视图；同时用 SQLite 持久化性能指标历史并提供只读范围查询 API；前端为
+单文件 HTML/CSS/JS（无构建步骤），提供性能看板与用量统计两个页面，顶部均可
+切换聚合/单服务。
 
 本工程只读取已运行的推理服务，不负责创建/启动/停止容器。
 
@@ -15,8 +16,9 @@
 
 | 文件 | 说明 |
 | --- | --- |
-| `server.py` | 后端全部逻辑（约 1400 行）：Prometheus 文本解析、`load_services`、`MetricsCollector`（单服务采集）、`ServiceRegistry`（多服务轮询+聚合）、HTTP 服务、路由 |
+| `server.py` | 后端全部逻辑（约 1700 行）：Prometheus 文本解析、`load_services`、`MetricsCollector`（单服务采集）、`ServiceRegistry`（多服务轮询+聚合+历史写入）、HTTP 服务、路由 |
 | `usage_stats.py` | `UsageStatsPlugin` 用量统计插件：按分钟把 Counter 增量与费用写入 CSV，启动时回读恢复 |
+| `metrics_history.py` | `MetricsHistoryStore`：标准库 `sqlite3` 持久化性能快照（10 秒采样、7 天保留、按 step 聚合查询） |
 | `services.yaml` | 多服务配置：`id`（内部 id，数据目录/URL 参数用）+ 可选 `name`（显示名）+ `metrics_url`；手写极简 YAML 解析，勿换 PyYAML |
 | `index.html` | 性能看板页面（单文件，内联 CSS/JS，约 2450 行） |
 | `usage.html` | 用量统计页面（单文件，内联 CSS/JS） |
@@ -24,15 +26,17 @@
 | `service.sh` | 后台服务管理：start/stop/restart/status/logs（setsid+nohup，PID 写 `server.pid`，日志追加 `server.log`） |
 | `images/` | 页面 logo，经 `/images/*` 路由提供 |
 | `usage_data/<id>/` | 每服务一个子目录，内含 `usage-YYYY-MM-DD.csv`（gitignore，含真实历史数据，勿删） |
+| `metrics_data/metrics.db` | 性能历史 SQLite（gitignore，运行时自动创建；勿提交） |
 | `server.log` / `server.pid` | 运行时产物（gitignore） |
 
 ## 构建与运行
 
-无构建、无测试框架、无 lint 配置。
+无构建、无 lint 配置；测试使用标准库 `unittest`（`tests/`）。
 
 ```bash
-python3 server.py                 # 前台运行
-./service.sh start|stop|status    # 后台运行（推荐，当前服务通常已在后台跑）
+python3 server.py                              # 前台运行
+./service.sh start|stop|status                 # 后台运行（推荐，当前服务通常已在后台跑）
+python3 -m unittest discover -s tests -v       # 标准库单元测试
 ```
 
 - 看板地址：`http://127.0.0.1:8090/`（性能）与 `http://127.0.0.1:8090/usage.html`（用量）
@@ -44,7 +48,14 @@ python3 server.py                 # 前台运行
 
 ## 验证方式
 
-无单元测试。改动后手动验证：
+标准库单元测试：
+
+```bash
+python3 -m py_compile server.py usage_stats.py metrics_history.py
+python3 -m unittest discover -s tests -v
+```
+
+改动后手动验证：
 
 ```bash
 ./service.sh status
@@ -52,8 +63,9 @@ curl -fsS http://127.0.0.1:8090/api/services                   # 服务列表与
 curl -fsS http://127.0.0.1:8090/api/health                     # 聚合健康（503 = 有上游不可达）
 curl -fsS "http://127.0.0.1:8090/api/metrics?service=all" | head -c 500
 curl -fsS "http://127.0.0.1:8090/api/metrics?service=antlserver01" | head -c 500
+curl -fsS "http://127.0.0.1:8090/api/metrics/history?service=antlab-vllm&minutes=60&step=10" | head -c 500
 curl -fsS http://127.0.0.1:8090/api/usage
-python3 -m py_compile server.py usage_stats.py                 # 语法检查
+python3 -m py_compile server.py usage_stats.py metrics_history.py  # 语法检查
 node --check <提取的页面内联 JS>                                 # 前端语法（可选）
 ```
 
@@ -75,18 +87,27 @@ node --check <提取的页面内联 JS>                                 # 前端
   schema 不一致返回 None → `--`）；健康状态取最差、错误带服务 id 前缀
 - **聚合历史**：registry 每轮追加 `_aggregate_history`（schema 同单服务
   `_display_history`），前端 60s 趋势图首次加载靠它填充
+- **性能历史**：`MetricsHistoryStore`（`metrics_history.py`）由 registry 单采集
+  线程每 10 秒 `maybe_record()` 一条 `ok=true` 快照；SQLite WAL +
+  `synchronous=NORMAL` + 单写者，`(service_id, ts)` 主键 `INSERT OR REPLACE`；
+  默认 7 天保留、启动时与每 24h 清理；JSON 只存规范化字段；查询按 `step`
+  分桶求数值平均、`model` 取桶内最后非空、`status` 取最差。写入/清理失败
+  只记日志，不影响 `/api/metrics`
 - **延迟分位数**：`_latency_delta_histograms()` 只对窗口内"新增"的 Histogram
   样本做分桶差集（结果缓存在 collector，`_record_error` 时清空防陈旧），
   `_latency_quantiles()` 插值（`histogram_quantile`），同一 non-le 标签序列才做差集
 - **健康状态机**：`starting / online / degraded / stale / offline`，
   超过 `STALE_AFTER_SECONDS` 未成功抓取即 stale
 - **HTTP 路由**（`make_handler`）：`/`、`/index.html`、`/usage.html`、
-  `/api/metrics`、`/api/health`、`/api/services`、`/api/raw`（默认禁用且需
-  具体服务，`ENABLE_RAW_API=true` 开启）、`/api/usage{,/history,/health}`、
-  `/images/*`（有路径穿越防护）、`/favicon.ico`
+  `/api/metrics`、`/api/metrics/history`（仅具体服务，`all`/缺省 400，
+  未知服务 404，历史关闭 404，DB 不可用 503）、`/api/health`、`/api/services`、
+  `/api/raw`（默认禁用且需具体服务，`ENABLE_RAW_API=true` 开启）、
+  `/api/usage{,/history,/health}`、`/images/*`（有路径穿越防护）、`/favicon.ico`
 - **线程模型**：registry 单采集线程（串行轮询所有服务）+ `ThreadingHTTPServer`
   （daemon 线程）；各 collector 状态读写走 `_state_lock`（RLock），抓取走
-  `_collect_lock`；前端读后端内存快照（`snapshot()`），多开浏览器不放大抓取压力
+  `_collect_lock`；历史写入在同一轮询线程，SQLite 访问由 store 内部 RLock
+  串行化（`check_same_thread=False`）；前端读后端内存快照（`snapshot()`），
+  多开浏览器不放大抓取压力
 - **安全头**：CSP（仅允许 inline script/style）、X-Frame-Options DENY、nosniff；
   无认证机制，`SERVER_HOST=0.0.0.0` 仅限可信网络
 
