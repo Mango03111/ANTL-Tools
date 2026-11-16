@@ -182,7 +182,7 @@ class MetricsHistoryStore:
         self._conn: sqlite3.Connection | None = None
         self._started = False
         self._last_error: str | None = None
-        self._last_record_monotonic: float | None = None
+        self._last_record_monotonic: dict[str, float] = {}
         self._stop_event = threading.Event()
         self._maintenance_thread: threading.Thread | None = None
 
@@ -208,7 +208,7 @@ class MetricsHistoryStore:
             if self._started:
                 return
             self._stop_event.clear()
-            self._last_record_monotonic = None
+            self._last_record_monotonic.clear()
             connection: sqlite3.Connection | None = None
             try:
                 self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -295,15 +295,15 @@ class MetricsHistoryStore:
         with self._lock:
             if not self._started or self._conn is None:
                 return False
+            last_record = self._last_record_monotonic.get(service_id)
             if (
-                self._last_record_monotonic is not None
-                and now_monotonic - self._last_record_monotonic
-                < self.interval_seconds
+                last_record is not None
+                and now_monotonic - last_record < self.interval_seconds
             ):
                 return False
-            # Throttle failed writes too: retry on the next interval instead of
-            # hammering a locked database every poll.
-            self._last_record_monotonic = now_monotonic
+            # Keep each service independent, including after failed writes:
+            # retry that service on its next interval, not on every poll.
+            self._last_record_monotonic[service_id] = now_monotonic
             try:
                 body = json.dumps(
                     payload,

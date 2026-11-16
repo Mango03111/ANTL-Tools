@@ -164,12 +164,12 @@ class MetricsHistoryStoreTest(unittest.TestCase):
         self.assertTrue(sample["time"])
 
     def test_service_isolation(self) -> None:
+        sample_ts = self.clock.now - 30
         self.assertTrue(
-            self.store.maybe_record("svc-a", make_snapshot(self.clock.now - 30))
+            self.store.maybe_record("svc-a", make_snapshot(sample_ts, running=2))
         )
-        self.clock.advance(10)
         self.assertTrue(
-            self.store.maybe_record("svc-b", make_snapshot(self.clock.now - 20))
+            self.store.maybe_record("svc-b", make_snapshot(sample_ts, running=7))
         )
 
         result_a = self.store.query("svc-a", minutes=60, step=10)
@@ -177,7 +177,66 @@ class MetricsHistoryStoreTest(unittest.TestCase):
 
         self.assertEqual(result_a["count"], 1)
         self.assertEqual(result_b["count"], 1)
-        self.assertNotEqual(result_a["samples"][0]["ts"], result_b["samples"][0]["ts"])
+        self.assertEqual(result_a["samples"][0]["requests"]["running"], 2)
+        self.assertEqual(result_b["samples"][0]["requests"]["running"], 7)
+
+    def test_interval_throttles_each_service_independently(self) -> None:
+        for elapsed, expected in ((0, True), (9, False), (1, True)):
+            self.clock.advance(elapsed)
+            for service_id in ("svc-a", "svc-b"):
+                with self.subTest(service=service_id, now=self.clock.now):
+                    self.assertEqual(
+                        self.store.maybe_record(
+                            service_id, make_snapshot(self.clock.now)
+                        ),
+                        expected,
+                    )
+
+        for service_id in ("svc-a", "svc-b"):
+            result = self.store.query(service_id, minutes=60, step=10)
+            self.assertEqual(result["count"], 2)
+        self.assertEqual(self._count_rows(), 4)
+
+    def test_staggered_services_keep_separate_intervals(self) -> None:
+        self.assertTrue(
+            self.store.maybe_record("svc-a", make_snapshot(self.clock.now))
+        )
+        self.clock.advance(5)
+        self.assertTrue(
+            self.store.maybe_record("svc-b", make_snapshot(self.clock.now))
+        )
+        self.clock.advance(5)
+        self.assertTrue(
+            self.store.maybe_record("svc-a", make_snapshot(self.clock.now))
+        )
+        self.assertFalse(
+            self.store.maybe_record("svc-b", make_snapshot(self.clock.now))
+        )
+        self.clock.advance(5)
+        self.assertFalse(
+            self.store.maybe_record("svc-a", make_snapshot(self.clock.now))
+        )
+        self.assertTrue(
+            self.store.maybe_record("svc-b", make_snapshot(self.clock.now))
+        )
+        self.assertEqual(self._count_rows(), 4)
+
+    def test_restart_resets_each_service_interval(self) -> None:
+        for service_id in ("svc-a", "svc-b"):
+            self.assertTrue(
+                self.store.maybe_record(service_id, make_snapshot(self.clock.now))
+            )
+        self.store.stop()
+        self.clock.advance(1)
+        self.store.start()
+        for service_id in ("svc-a", "svc-b"):
+            self.assertTrue(
+                self.store.maybe_record(service_id, make_snapshot(self.clock.now))
+            )
+            self.assertFalse(
+                self.store.maybe_record(service_id, make_snapshot(self.clock.now))
+            )
+        self.assertEqual(self._count_rows(), 4)
 
     def test_time_range_filtering(self) -> None:
         old_ts = self.clock.now - 2 * 60 * 60

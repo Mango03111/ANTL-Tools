@@ -19,6 +19,7 @@
 | `server.py` | 后端全部逻辑（约 1700 行）：Prometheus 文本解析、`load_services`、`MetricsCollector`（单服务采集）、`ServiceRegistry`（多服务轮询+聚合+历史写入）、HTTP 服务、路由 |
 | `usage_stats.py` | `UsageStatsPlugin` 用量统计插件：按分钟把 Counter 增量与费用写入 CSV，启动时回读恢复 |
 | `metrics_history.py` | `MetricsHistoryStore`：标准库 `sqlite3` 持久化性能快照（10 秒采样、7 天保留、按 step 聚合查询） |
+| `tests/` | 标准库单元测试与 API 测试；包含同轮多服务写入、独立限流和重启回归用例 |
 | `services.yaml` | 多服务配置：`id`（内部 id，数据目录/URL 参数用）+ 可选 `name`（显示名）+ `metrics_url`；手写极简 YAML 解析，勿换 PyYAML |
 | `index.html` | 性能看板页面（单文件，内联 CSS/JS，约 2450 行） |
 | `usage.html` | 用量统计页面（单文件，内联 CSS/JS） |
@@ -88,8 +89,8 @@ node --check <提取的页面内联 JS>                                 # 前端
 - **聚合历史**：registry 每轮追加 `_aggregate_history`（schema 同单服务
   `_display_history`），前端 60s 趋势图首次加载靠它填充
 - **性能历史**：`MetricsHistoryStore`（`metrics_history.py`）由 registry 单采集
-  线程每 10 秒 `maybe_record()` 一条 `ok=true` 快照；SQLite WAL +
-  `synchronous=NORMAL` + 单写者，`(service_id, ts)` 主键 `INSERT OR REPLACE`；
+  线程对每个服务独立限流，每 10 秒 `maybe_record()` 一条 `ok=true` 快照；
+  SQLite WAL + `synchronous=NORMAL` + 单写者，`(service_id, ts)` 主键 `INSERT OR REPLACE`；
   默认 7 天保留、启动时与每 24h 清理；JSON 只存规范化字段；查询按 `step`
   分桶求数值平均、`model` 取桶内最后非空、`status` 取最差。写入/清理失败
   只记日志，不影响 `/api/metrics`

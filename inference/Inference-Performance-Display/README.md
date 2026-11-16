@@ -182,8 +182,8 @@ services:
 
 - 数据路径：`metrics_data/metrics.db`（相对 `server.py`；`METRICS_HISTORY_DB`
   可覆盖，目录自动创建，`metrics_data/` 已加入 `.gitignore`）。
-- 写入节奏：`ServiceRegistry` 的单个轮询线程每 10 秒最多写一条，只记录
-  `ok=true` 的成功抓取；主键 `(service_id, ts)`，重复时间戳用
+- 写入节奏：`ServiceRegistry` 的单个轮询线程对每个服务独立限流，每 10 秒
+  最多写一条，只记录 `ok=true` 的成功抓取；主键 `(service_id, ts)`，重复时间戳用
   `INSERT OR REPLACE` 覆盖。
 - 保留：默认 7 天，启动时清理一次，之后每 24 小时清理；写入/清理失败只记
   日志，不会让监控退出。
