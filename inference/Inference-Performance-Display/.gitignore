@@ -19,3 +19,6 @@ venv/
 # Runtime usage exports (keep the directory itself available in deployments).
 # Usage CSVs live in per-service subdirectories: usage_data/<id>/usage-*.csv
 usage_data/**/*.csv
+
+# Runtime performance history (SQLite database; never commit).
+metrics_data/

@@ -20,6 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Sequence
 
+from metrics_history import HistoryUnavailableError, MetricsHistoryStore
 from usage_stats import UsageStatsPlugin
 
 # ---------------------------------------------------------------------------
@@ -35,6 +36,11 @@ DEFAULT_LATENCY_WINDOW_SECONDS = 30.0
 DEFAULT_ENABLE_RAW_API = False
 DEFAULT_ENABLE_USAGE_STATS = True
 DEFAULT_USAGE_WRITE_INTERVAL_SECONDS = 60.0
+DEFAULT_ENABLE_METRICS_HISTORY = True
+DEFAULT_METRICS_HISTORY_DB = "metrics_data/metrics.db"
+DEFAULT_METRICS_HISTORY_INTERVAL_SECONDS = 10.0
+DEFAULT_METRICS_HISTORY_RETENTION_DAYS = 7
+DEFAULT_METRICS_HISTORY_MAX_POINTS = 5000
 # Resolve the usage data/pricing defaults relative to this script so the
 # server works no matter which directory it is started from.
 _BASE_DIR = Path(__file__).resolve().parent
@@ -71,6 +77,11 @@ class Config:
     usage_write_interval_seconds: float
     usage_data_dir: Path
     usage_pricing_file: Path
+    enable_metrics_history: bool
+    metrics_history_db: Path
+    metrics_history_interval_seconds: float
+    metrics_history_retention_days: int
+    metrics_history_max_points: int
     services_file: Path
 
     @classmethod
@@ -105,6 +116,28 @@ class Config:
             usage_write_interval_seconds=_env_float("USAGE_WRITE_INTERVAL_SECONDS", DEFAULT_USAGE_WRITE_INTERVAL_SECONDS, minimum=1.0, maximum=86400.0),
             usage_data_dir=(_BASE_DIR / Path(os.getenv("USAGE_DATA_DIR", DEFAULT_USAGE_DATA_DIR))).resolve(),
             usage_pricing_file=Path(os.getenv("USAGE_PRICING_FILE", DEFAULT_USAGE_PRICING_FILE)),
+            enable_metrics_history=_env_bool("ENABLE_METRICS_HISTORY", DEFAULT_ENABLE_METRICS_HISTORY),
+            metrics_history_db=(
+                _BASE_DIR / Path(os.getenv("METRICS_HISTORY_DB", DEFAULT_METRICS_HISTORY_DB))
+            ).resolve(),
+            metrics_history_interval_seconds=_env_float(
+                "METRICS_HISTORY_INTERVAL_SECONDS",
+                DEFAULT_METRICS_HISTORY_INTERVAL_SECONDS,
+                minimum=1.0,
+                maximum=300.0,
+            ),
+            metrics_history_retention_days=_env_int(
+                "METRICS_HISTORY_RETENTION_DAYS",
+                DEFAULT_METRICS_HISTORY_RETENTION_DAYS,
+                minimum=1,
+                maximum=365,
+            ),
+            metrics_history_max_points=_env_int(
+                "METRICS_HISTORY_MAX_POINTS",
+                DEFAULT_METRICS_HISTORY_MAX_POINTS,
+                minimum=1,
+                maximum=1_000_000,
+            ),
             services_file=Path(os.getenv("SERVICES_FILE", DEFAULT_SERVICES_FILE)),
         )
 
@@ -970,6 +1003,16 @@ class ServiceRegistry:
                 usage_data_dir=config.usage_data_dir / spec.id,
             )
             self.collectors[spec.id] = MetricsCollector(service_config)
+        self.history: MetricsHistoryStore | None = (
+            MetricsHistoryStore(
+                config.metrics_history_db,
+                interval_seconds=config.metrics_history_interval_seconds,
+                retention_days=config.metrics_history_retention_days,
+                max_points=config.metrics_history_max_points,
+            )
+            if config.enable_metrics_history
+            else None
+        )
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._aggregate_history: deque[dict[str, object]] = deque(maxlen=720)
@@ -978,6 +1021,8 @@ class ServiceRegistry:
         if self._thread is not None and self._thread.is_alive():
             return
         self._stop_event.clear()
+        if self.history is not None:
+            self.history.start()
         for collector in self.collectors.values():
             collector.start()
         self._thread = threading.Thread(
@@ -993,14 +1038,18 @@ class ServiceRegistry:
             )
         for collector in self.collectors.values():
             collector.stop()
+        if self.history is not None:
+            self.history.stop()
 
     def _run(self) -> None:
         while not self._stop_event.is_set():
             started = time.monotonic()
-            for collector in self.collectors.values():
+            for spec in self.services:
                 if self._stop_event.is_set():
                     break
-                collector.collect_once()
+                snapshot = self.collectors[spec.id].collect_once()
+                if self.history is not None:
+                    self.history.maybe_record(spec.id, snapshot)
             self._append_aggregate_point()
             elapsed = time.monotonic() - started
             self._stop_event.wait(max(0.0, self.config.poll_interval_seconds - elapsed))
@@ -1025,6 +1074,14 @@ class ServiceRegistry:
         if collector.usage is None:
             return {"ok": False, "error": "usage statistics are disabled"}
         return collector.usage.api_payload()
+
+    def history_payload(
+        self, service: str, minutes: int = 60, step: int = 10
+    ) -> dict[str, object]:
+        if self.history is None:
+            raise HistoryUnavailableError("metrics history is disabled")
+        self._resolve(service)
+        return self.history.query(service, minutes, step)
 
     def raw_metrics(self, service: str) -> str:
         return self._resolve(service).raw_metrics()
@@ -1413,9 +1470,77 @@ def make_handler(
                 {"ok": False, "error": f"unknown service: {service}"}, status=404
             )
 
+        def _int_query_param(
+            self,
+            params: Mapping[str, list[str]],
+            name: str,
+            default: int,
+            minimum: int,
+            maximum: int,
+        ) -> int:
+            raw = params.get(name, [None])[0]
+            if raw is None or raw.strip() == "":
+                return default
+            try:
+                value = int(raw)
+            except ValueError as exc:
+                raise ValueError(
+                    f"{name} must be an integer between {minimum} and {maximum}"
+                ) from exc
+            if not minimum <= value <= maximum:
+                raise ValueError(
+                    f"{name} must be an integer between {minimum} and {maximum}"
+                )
+            return value
+
+        def _history_request(self) -> None:
+            if registry.history is None:
+                self._send_json(
+                    {"ok": False, "error": "metrics history is disabled"}, status=404
+                )
+                return
+            params = urllib.parse.parse_qs(
+                urllib.parse.urlsplit(self.path).query, keep_blank_values=True
+            )
+            service = params.get("service", [None])[0]
+            if service is None or service == "":
+                self._send_json(
+                    {"ok": False, "error": "service is required"}, status=400
+                )
+                return
+            if service == "all":
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": (
+                            "service=all is not supported in this version; "
+                            "use a specific service id"
+                        ),
+                    },
+                    status=400,
+                )
+                return
+            try:
+                minutes = self._int_query_param(params, "minutes", 60, 1, 1440)
+                step = self._int_query_param(params, "step", 10, 1, 300)
+                payload = registry.history_payload(service, minutes, step)
+            except KeyError:
+                self._unknown_service(service)
+                return
+            except ValueError as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=400)
+                return
+            except HistoryUnavailableError as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=503)
+                return
+            self._send_json(payload)
+
         def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
             path = urllib.parse.urlsplit(self.path).path
             service = self._service_param()
+            if path == "/api/metrics/history":
+                self._history_request()
+                return
             if path == "/api/metrics":
                 try:
                     self._send_json(registry.metrics_payload(service))
@@ -1618,6 +1743,14 @@ def main() -> int:
         f"rate window {config.rate_window_seconds:g} s; "
         f"latency window {config.latency_window_seconds:g} s"
     )
+    if config.enable_metrics_history:
+        print(
+            f"Metrics history: {config.metrics_history_db} "
+            f"(every {config.metrics_history_interval_seconds:g} s, "
+            f"retain {config.metrics_history_retention_days} days)"
+        )
+    else:
+        print("Metrics history: disabled")
     try:
         server.serve_forever(poll_interval=0.25)
     except KeyboardInterrupt:
