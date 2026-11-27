@@ -1503,6 +1503,7 @@
         </label>
         <button class="toolbar-button" type="button" id="pause-button" aria-pressed="false">暂停图表</button>
         <button class="toolbar-button" type="button" id="clear-button">清空趋势</button>
+        <a class="toolbar-button" id="export-history-button" href="/api/metrics.csv?service=all" download>导出趋势 CSV</a>
         <a class="toolbar-button" href="/usage.html">用量统计</a>
         <span class="paused-note" aria-live="polite">图表已暂停</span>
       </div>
@@ -1785,6 +1786,7 @@
         refreshInterval: document.getElementById("refresh-interval"),
         pauseButton: document.getElementById("pause-button"),
         clearButton: document.getElementById("clear-button"),
+        exportHistoryButton: document.getElementById("export-history-button"),
         source: document.getElementById("source-value"),
         model: document.getElementById("model-value"),
         sampleTime: document.getElementById("sample-time-value"),
@@ -1853,6 +1855,11 @@
         } catch (_error) {
           // The dashboard remains functional when storage is disabled.
         }
+      }
+
+      function updateExportLink() {
+        elements.exportHistoryButton.href =
+          `/api/metrics.csv?service=${encodeURIComponent(state.service)}`;
       }
 
       async function loadServices() {
@@ -2451,8 +2458,10 @@
 
       function setService(service) {
         persistService(service);
-        if (service === state.service) return;
+        const changed = service !== state.service;
         state.service = service;
+        updateExportLink();
+        if (!changed) return;
         window.clearTimeout(state.timer);
         state.inFlight?.abort();
         state.inFlight = null;
